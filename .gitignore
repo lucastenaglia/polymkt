@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+bot.db
+*.txt
+*.log
+*.tmp
+*.json
+!package.json
+!tsconfig.json
+!src/**/*.json
+!.antigravityignore
