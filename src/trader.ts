@@ -454,12 +454,7 @@ export async function getBalances(): Promise<Balances> {
                 }
 
                 if (cashNum < 0.5) {
-                    console.warn('❌ NOT ENOUGH BALANCE. Bot will wait.');
-                    const now = Date.now();
-                    if (now - lastBalanceErrorTime > BALANCE_ERROR_THROTTLE_MS) {
-                        sendErrorNotification(`Not enough balance: ${cashNum} USDC.e (Error will be throttled for 1 hour)`);
-                        lastBalanceErrorTime = now;
-                    }
+                    console.warn(`❌ [TRADER] Insufficient Balance: ${cashNum} USDC.e. Bot will wait for funds.`);
                 } else {
                     isTraderReady = true;
                     console.log('🚀 TRADER IS READY AND FULLY CONFIGURED.');
