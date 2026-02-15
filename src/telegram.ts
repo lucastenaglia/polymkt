@@ -48,42 +48,66 @@ export async function startBot() {
         const text = msg.text;
 
         if (text === "💰 Balance") {
-            const balances = await getBalances();
-            bot.sendMessage(chatId, `
+            try {
+                const balances = await getBalances();
+                bot.sendMessage(chatId, `
 💰 *Balance Check*
             
 📊 *Portfolio*: $${balances.portfolio}
 💵 *Cash*: $${balances.cash}
 ⛽ *Matic*: ${parseFloat(balances.matic).toFixed(4)}
-            `, { parse_mode: 'Markdown' });
+                `, { parse_mode: 'Markdown' });
+            } catch (e: any) {
+                bot.sendMessage(chatId, `❌ Error: ${e.message}`);
+            }
         }
 
         if (text === "📈 Open Positions") {
-            const positions: Position[] = getOpenPositions();
-            if (positions.length === 0) {
-                bot.sendMessage(chatId, "No open positions.");
-            } else {
-                let msgText = "📈 *Active Copy Trades*:\n\n";
-                // Lazy import TARGET_NAMES to avoid circular dependency
-                const { TARGET_NAMES } = require('./trader');
-                positions.forEach((p: Position) => {
-                    const targetDisplay = p.target_user ? (TARGET_NAMES[p.target_user.toLowerCase()] || p.target_user) : 'N/A';
-                    msgText += `• ${p.outcome} | $${p.amount} | Target: *${targetDisplay}*\n`;
-                });
-                bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+            try {
+                const positions: Position[] = getOpenPositions();
+                if (positions.length === 0) {
+                    bot.sendMessage(chatId, "No open positions.");
+                } else {
+                    const total = positions.length;
+                    const displayList = positions.slice(0, 20); // Limit to latest 20 to avoid Telegram message length limits
+
+                    let msgText = `📈 *Active Copy Trades (${total} total)*:\n_Showing latest 20_\n\n`;
+                    const { TARGET_NAMES } = require('./trader');
+
+                    displayList.forEach((p: Position) => {
+                        const targetLine = p.target_user ? (TARGET_NAMES[p.target_user.toLowerCase()] || p.target_user) : 'N/A';
+                        // Basic escaping for target names that might be addresses or handles
+                        const safeTarget = targetLine.replace(/[_*`]/g, '\\$&');
+                        const outcome = (p.outcome || 'Unknown').replace(/[_*`]/g, '\\$&');
+                        const amount = typeof p.amount === 'number' ? p.amount.toFixed(2) : p.amount;
+
+                        msgText += `• ${outcome} | $${amount} | Target: ${safeTarget}\n`;
+                    });
+
+                    bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+                }
+            } catch (e: any) {
+                console.error('[TELEGRAM] Error in Open Positions:', e.message);
+                bot.sendMessage(chatId, `❌ Error: ${e.message}`);
             }
         }
 
         if (text === "📉 Closed Positions") {
-            const positions: Position[] = getClosedPositions();
-            if (positions.length === 0) {
-                bot.sendMessage(chatId, "No closed positions.");
-            } else {
-                let msgText = "📉 *Last 10 Closed Positions*:\n\n";
-                positions.forEach((p: Position) => {
-                    msgText += `• ${p.status} ($${p.amount})\n`;
-                });
-                bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+            try {
+                const positions: Position[] = getClosedPositions();
+                if (positions.length === 0) {
+                    bot.sendMessage(chatId, "No closed positions.");
+                } else {
+                    let msgText = "📉 *Last 10 Closed Positions*:\n\n";
+                    positions.forEach((p: Position) => {
+                        const amount = typeof p.amount === 'number' ? p.amount.toFixed(2) : p.amount;
+                        const outcome = (p.outcome || 'Unknown').replace(/[_*`]/g, '\\$&');
+                        msgText += `• ${outcome} ($${amount})\n`;
+                    });
+                    bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown' });
+                }
+            } catch (e: any) {
+                bot.sendMessage(chatId, `❌ Error: ${e.message}`);
             }
         }
 
