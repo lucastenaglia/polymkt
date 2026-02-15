@@ -6,6 +6,7 @@ export interface Position {
     entry_price: number;
     timestamp: number;
     target_user?: string;
+    id?: number;
 }
 
 export interface TradeNotificationData {

@@ -41,12 +41,60 @@ db.exec(`
   );
 `);
 
-// Migration: Check if target_user exists in positions
+// Migration 1: Check if target_user exists in positions
 try {
   db.prepare('SELECT target_user FROM positions LIMIT 1').get();
 } catch (e) {
   console.log('Migrating database: Adding target_user column to positions table...');
   db.exec('ALTER TABLE positions ADD COLUMN target_user TEXT');
+}
+
+// Migration 2: Check if 'id' exists (Primary Key)
+// Older versions might not have 'id' explicit column
+try {
+  db.prepare('SELECT id FROM positions LIMIT 1').get();
+} catch (e) {
+  console.log('Migrating database: Recreating positions table with ID primary key...');
+
+  db.transaction(() => {
+    // 1. Rename old table
+    db.exec('ALTER TABLE positions RENAME TO positions_old');
+
+    // 2. Create new table
+    db.exec(`
+      CREATE TABLE positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        market_id TEXT,
+        outcome TEXT,
+        amount REAL,
+        status TEXT,
+        entry_price REAL,
+        timestamp INTEGER,
+        target_user TEXT,
+        slug TEXT
+      )
+    `);
+
+    // 3. Copy data (Mapping columns correctly)
+    // Old schema: market_id, outcome, amount, status, entry_price, timestamp, target_user
+    // New schema: id (auto), ... same ...
+    db.exec(`
+      INSERT INTO positions (market_id, outcome, amount, status, entry_price, timestamp, target_user)
+      SELECT market_id, outcome, amount, status, entry_price, timestamp, target_user
+      FROM positions_old
+    `);
+
+    // 4. Drop old table
+    db.exec('DROP TABLE positions_old');
+  })();
+}
+
+// Migration 3: Check if 'slug' exists
+try {
+  db.prepare('SELECT slug FROM positions LIMIT 1').get();
+} catch (e) {
+  console.log('Migrating database: Adding slug column to positions table...');
+  db.exec('ALTER TABLE positions ADD COLUMN slug TEXT');
 }
 
 // Seed stats if empty

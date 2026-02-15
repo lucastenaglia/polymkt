@@ -1,80 +1,30 @@
 import { ethers } from 'ethers';
-import { config } from '../src/config';
+import * as dotenv from 'dotenv';
+import { CONDITIONAL_TOKENS_ABI } from '../src/abi';
 
-// Polygon USDC.e (Bridged) - stored in 6 decimals
-const USDC_ADDR = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-const USDC_ABI = [
-    "function balanceOf(address owner) view returns (uint256)",
-    "function decimals() view returns (uint8)",
-    "function symbol() view returns (string)"
-];
+dotenv.config();
 
-import { ClobClient } from '@polymarket/clob-client';
+const CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+const PROXY = "0x49CF8d56dFfaC0e6e0E8ABe70c605bf11a7E0f9b";
+const RPC = "https://polygon-rpc.com";
 
-async function checkBalance() {
-    if (!config.privateKey) {
-        console.error("❌ No Private Key found in .env! Please set PRIVATE_KEY.");
-        return;
-    }
+async function check() {
+    const provider = new ethers.providers.JsonRpcProvider(RPC);
+    const ctf = new ethers.Contract(CTF, CONDITIONAL_TOKENS_ABI, provider);
 
-    const pk = config.privateKey.trim();
+    // Token IDs from logs
+    const ids = [
+        "2077190203464600902565435671056513681491397438145858116833822261219765973691",
+        "50321401639280794332079098856566060695718647165467327290687188939911014501908",
+        "97976693006985082827835994596059319553775700514787459898014961359842076013000",
+        "54756173421078384014629518618194842052488995146219229104798588910643569098257"
+    ];
 
-    // ... validation ... 
-    if (pk.length < 60) {
-        console.error("❌ Private Key seems too short.");
-    }
-    const isHex = /^(0x)?[0-9a-fA-F]+$/.test(pk);
-    if (!isHex) {
-        console.error("❌ Private Key contains non-hex characters.");
-        return;
-    }
-
-    const provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
-    const wallet = new ethers.Wallet(pk, provider);
-
-    console.log(`Checking balance for EOA: ${wallet.address}`);
-
-    try {
-        // 1. Check MATIC (Native)
-        const maticBalanceWei = await wallet.getBalance();
-        const maticBalance = ethers.utils.formatEther(maticBalanceWei);
-        console.log(`💰 MATIC: ${maticBalance}`);
-
-        // 2. Check USDC (ERC20)
-        const usdcContract = new ethers.Contract(USDC_ADDR, USDC_ABI, provider);
-        const usdcBalanceRaw = await usdcContract.balanceOf(wallet.address);
-        const decimals = await usdcContract.decimals();
-        const symbol = await usdcContract.symbol();
-        const usdcBalance = ethers.utils.formatUnits(usdcBalanceRaw, decimals);
-
-        console.log(`💵 EOA USDC: ${usdcBalance}`);
-
-        // 3. Check Polymarket Portfolio (Proxy Wallet)
-        console.log("Checking Polymarket Portfolio...");
-        try {
-            const clobClient = new ClobClient(config.rpcUrl, 137, wallet);
-            // This ensures we have the API keys derived/ready
-            const creds = await clobClient.deriveApiKey();
-            console.log("✅ API Keys Derived");
-
-            // Try to get balance
-            // @ts-ignore
-            if (typeof clobClient.getCollateralBalance === 'function') {
-                // @ts-ignore
-                const proxyBal = await clobClient.getCollateralBalance();
-                // @ts-ignore
-                console.log(`🏦 Proxy/CTF USDC: ${proxyBal}`);
-            } else {
-                console.log("⚠️ createOrder is available, assuming setup is correct. (Balance check method not found)");
-            }
-
-        } catch (err: any) {
-            console.error("❌ Failed to connect to Polymarket CLOB:", err.message);
-        }
-
-    } catch (error) {
-        console.error("❌ Error checking balance:", error);
+    console.log(`Checking Proxy: ${PROXY}`);
+    for (const id of ids) {
+        const bal = await ctf.balanceOf(PROXY, id);
+        console.log(`ID ${id.substring(0, 10)}... Balance: ${bal.toString()}`);
     }
 }
 
-checkBalance();
+check();

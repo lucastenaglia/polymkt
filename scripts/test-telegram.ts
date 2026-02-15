@@ -1,26 +1,31 @@
-import { sendTradeNotification } from '../src/telegram';
 
-async function testTelegram() {
-    console.log('Sending test message to Telegram...');
+import { sendTradeNotification, sendErrorNotification } from '../src/telegram';
+import { TradeNotificationData } from '../src/types';
+import { config } from '../src/config';
 
-    const dummyData = {
-        targetUser: '0x1234567890abcdef1234567890abcdef12345678',
-        marketSlug: 'will-btc-hit-100k-in-2024',
-        marketId: '0x123',
+console.log('Testing Telegram Notification...');
+console.log('Token:', config.telegramToken ? 'OK' : 'MISSING');
+console.log('ChatID:', config.telegramChatId ? config.telegramChatId : 'MISSING');
+
+async function test() {
+    const mockTrade: TradeNotificationData = {
+        targetUser: '0x1979ae6B7E6534dE9c4539D0c205E582cA637C9D',
+        targetName: '0x1979',
+        marketSlug: 'test-market-slug',
+        marketId: '0x123456789',
         side: 'BUY',
-        outcome: 'YES',
-        amountUsd: 10.00,
-        price: '0.55',
-        txHash: '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
-        newBalance: '100.00'
+        outcome: 'Yes',
+        amountUsd: 1.0,
+        price: 0.50,
+        txHash: '0xmocktxhash',
+        newBalance: '15.00 USDC'
     };
 
-    try {
-        await sendTradeNotification(dummyData);
-        console.log('Message sent! Check your Telegram.');
-    } catch (error) {
-        console.error('Failed to send message:', error);
-    }
+    console.log('Sending mock trade notification...');
+    await sendTradeNotification(mockTrade);
+
+    console.log('Sending mock error notification...');
+    await sendErrorNotification('This is a test error from the debug script.');
 }
 
-testTelegram();
+test();

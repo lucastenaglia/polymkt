@@ -9,10 +9,11 @@ const bot = new TelegramBot(config.telegramToken, { polling: true });
 
 // Handle Polling Errors (silence EFATAL noise)
 bot.on('polling_error', (error: any) => {
-    if (error.code === 'EFATAL' || error.message?.includes('AggregateError')) {
+    const msg = error.message || error;
+    if (error.code === 'EFATAL' || error.code === 'ETIMEDOUT' || msg.includes('AggregateError') || msg.includes('socket hang up') || msg.includes('timeout')) {
         return; // Silently ignore transient network/polling issues
     }
-    console.error('Telegram Polling Error:', error.message || error);
+    console.error('Telegram Polling Error:', msg);
 });
 
 export async function startBot() {
@@ -30,6 +31,7 @@ export async function startBot() {
             reply_markup: {
                 keyboard: [
                     [{ text: "💰 Balance" }, { text: "💸 Claim" }],
+                    [{ text: "🛑 STOP" }, { text: "▶️ START" }],
                     [{ text: "📈 Open Positions" }, { text: "📉 Closed Positions" }],
                     [{ text: "🚀 Cerrar Todo" }]
                 ],
@@ -107,6 +109,18 @@ export async function startBot() {
                 bot.sendMessage(chatId, `❌ Error al cobrar: ${e.message}`);
             }
         }
+
+        if (text === "🛑 STOP") {
+            const { setPauseState } = require('./trader');
+            setPauseState(true);
+            bot.sendMessage(chatId, "🛑 Bot PAUSADO. No se abrirán nuevas posiciones ni se monitorearán nuevos eventos.");
+        }
+
+        if (text === "▶️ START") {
+            const { setPauseState } = require('./trader');
+            setPauseState(false);
+            bot.sendMessage(chatId, "▶️ Bot ACTIVADO. Monitoreo y operaciones reanudadas.");
+        }
     });
 }
 
@@ -125,13 +139,18 @@ export async function sendTradeNotification(data: TradeNotificationData) {
 💸 *Entry Price*: $${data.price}
 🔗 *TX*: [View on PolygonScan](https://polygonscan.com/tx/${data.txHash})
 
-💰 *Bot Balance*: $${data.newBalance}
+💰 *Bot Balance*: ${data.newBalance}
 `;
 
     try {
         await bot.sendMessage(config.telegramChatId, message, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.error('Telegram Error:', error);
+    } catch (error: any) {
+        // Suppress timeout errors to prevent spam
+        if (error.code === 'ETIMEDOUT' || error.message?.includes('timeout') || error.message?.includes('socket hang up')) {
+            console.warn('[TELEGRAM] Notification timed out (Message sent but not confirmed due to network lag).');
+        } else {
+            console.warn('[TELEGRAM] Failed to send notification:', error.message);
+        }
     }
 }
 
@@ -139,9 +158,12 @@ export async function sendErrorNotification(error: any) {
     if (!config.telegramChatId) return;
     try {
         const errorString = typeof error === 'string' ? error : (error?.message || JSON.stringify(error) || 'Unknown Error');
+        // Prevent massive error spam
+        if (errorString.includes('ETIMEDOUT') || errorString.includes('socket hang up')) return;
+
         const text = `⚠️ *Error*: ${errorString.replace(/_/g, '\\_')}`; // Escape underscores
         await bot.sendMessage(config.telegramChatId, text, { parse_mode: 'Markdown' });
     } catch (e) {
-        console.error('Telegram Error:', e);
+        // Ignore failures to send error notifications
     }
 }

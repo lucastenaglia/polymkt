@@ -5,21 +5,143 @@ import { ethers } from 'ethers';
 import { config } from './config';
 import { monitorEvents } from './monitor';
 import db from './db';
-import { getMarketFromUserPosition } from './utils';
+import { getMarketFromUserPosition, cacheMarket } from './utils';
 import { sendTradeNotification, sendErrorNotification } from './telegram';
-import { Balances, TradeNotificationData } from './types';
+import { Balances, TradeNotificationData, Position } from './types';
+
+// ... (rest of imports)
+
+// ... (existing code)
+
+export async function closeSpecificPosition(position: Position) {
+    if (!clobClient || !signer) return;
+
+    try {
+        const marketID = position.market_id; // Correction: Position interface uses snake_case in DB but might be mapped. Let's check type.
+        // Actually, the Position type might use camelCase if mapped, or snake_case if raw DB.
+        // Let's assume raw DB for now as that's what we get from 'db.prepare(...).get()'.
+
+        const outcome = position.outcome; // 'Yes' or 'No'
+
+        // Fetch market to get tokens
+        const market = await clobClient.getMarket(marketID);
+        if (!market) {
+            console.error(`[CLOSING] Market not found for ${marketID}`);
+            return;
+        }
+
+        const token0 = market.tokens?.[0] as any;
+        const token1 = market.tokens?.[1] as any;
+
+        if (!token0 || !token1) {
+            console.error(`[CLOSING] Tokens not found in market data for ${marketID}`, JSON.stringify(market));
+            return;
+        }
+
+        console.log(`[CLOSING] Token0: ${JSON.stringify(token0)}`);
+
+        const t0Id = token0.tokenId || token0.token_id;
+        const t1Id = token1.tokenId || token1.token_id;
+
+        if (!t0Id || !t1Id) {
+            console.error(`[CLOSING] Could not find token ID in objects. Keys: ${Object.keys(token0)}`);
+            return;
+        }
+
+        console.log(`[CLOSING] Checking balances for Tokens: ${t0Id}, ${t1Id}`);
+
+        const funder = config.proxyAddress || signer.address;
+        const ctf = new ethers.Contract(CONDITIONAL_TOKENS_ADDR, CONDITIONAL_TOKENS_ABI, signer);
+        const balance0 = await ctf.balanceOf(funder, t0Id);
+        const balance1 = await ctf.balanceOf(funder, t1Id);
+
+        console.log(`[CLOSING] B0 (${funder}): ${balance0?.toString()}, B1: ${balance1?.toString()}`);
+
+        const updates = [];
+
+        if (balance0 && balance0.gt(0)) {
+            console.log(`[CLOSING] Selling Token 0 (Balance: ${balance0.toString()})...`);
+            await clobClient.createAndPostOrder({
+                tokenID: t0Id,
+                price: 0.001, // Market Sell (Dump)
+                side: Side.SELL,
+                size: parseFloat(ethers.utils.formatUnits(balance0, 6)),
+                feeRateBps: 0,
+            });
+            updates.push('Token0');
+        }
+
+        if (balance1.gt(0)) {
+            console.log(`[CLOSING] Selling Token 1 (Balance: ${balance1.toString()})...`);
+            await clobClient.createAndPostOrder({
+                tokenID: t1Id,
+                price: 0.001,
+                side: Side.SELL,
+                size: parseFloat(ethers.utils.formatUnits(balance1, 6)),
+                feeRateBps: 0,
+            });
+            updates.push('Token1');
+        }
+
+        if (updates.length > 0) {
+            db.prepare('UPDATE positions SET status = ? WHERE id = ?').run('CLOSED', position.id);
+            console.log(`[CLOSING] Successfully closed position ${position.id} on-chain. Marked as CLOSED in DB.`);
+
+            const notificationData: TradeNotificationData = {
+                targetUser: position.target_user || 'Unknown',
+                targetName: 'Bot',
+                marketSlug: position.market_id,
+                marketId: position.market_id,
+                side: 'SELL',
+                outcome: position.outcome,
+                amountUsd: position.amount,
+                price: 'Market',
+                txHash: 'Market Sell',
+                newBalance: '...'
+            };
+            sendTradeNotification(notificationData);
+        } else {
+            // If we are here, balance was 0 but we tried to close it. 
+            // In Proxy Mode, if the balance check says 0, maybe we should still mark as closed to avoid loops?
+            // Actually, if balance is 0, we can safely mark as CLOSED because there is nothing left to sell.
+            console.log(`[CLOSING] On-chain balance is 0 for ${position.market_id}. Marking as CLOSED to sync DB.`);
+            db.prepare('UPDATE positions SET status = ? WHERE id = ?').run('CLOSED', position.id);
+        }
+
+    } catch (e: any) {
+        console.error('[TRADER] Error closing position:', e.message);
+    }
+}
+
 
 const provider = new ethers.providers.JsonRpcProvider(config.rpcUrl);
 const signer = new ethers.Wallet(config.privateKey || ethers.Wallet.createRandom().privateKey, provider);
 
 let clobClient: ClobClient;
 let isTraderReady = false;
+let isPaused = false; // Default: Running
 let lastTradeTime = 0;
 const MIN_TRADE_INTERVAL_MS = 5000; // 5 seconds between trades to prevent draining
 
+// Safety Limits
+const lastTradePerMarketOutcome: Record<string, number> = {};
+const TRADE_COOLDOWN_MS = 60000; // 1 minute per market/outcome
+const MAX_TOTAL_POSITION_SIZE_USD = 10.0; // Don't exceed $10 in one outcome
+
+export function setPauseState(paused: boolean) {
+    isPaused = paused;
+    console.log(`[TRADER] Bot is now ${isPaused ? 'PAUSED 🛑' : 'ACTIVE ▶️'}`);
+    return isPaused;
+}
+
+export function getPauseState() {
+    return isPaused;
+}
+
 // Name mapping for targets
 export const TARGET_NAMES: Record<string, string> = {
-    '0x818f214c7f3e479cce1d964d53fe3db7297558cb': 'livebreathevolatility'
+    '0x818f214c7f3e479cce1d964d53fe3db7297558cb': 'livebreathevolatility',
+    '0x1979ae6b7e6534de9c4539d0c205e582ca637c9d': '0x1979'
 };
 
 // Error suppression/throttling
@@ -148,6 +270,7 @@ async function syncExistingPositions(userAddress: string, targets: string[]) {
     }
 
     // 2. Sync Target Positions (To mark markets as ineligible)
+    // 2. Sync Target Positions (To populate Market Cache)
     for (const target of targets) {
         if (!ethers.utils.isAddress(target)) {
             console.log(`[SYNC] Skipping non-address target: ${target}`);
@@ -155,18 +278,24 @@ async function syncExistingPositions(userAddress: string, targets: string[]) {
         }
 
         try {
-            const targetRes = await axios.get(`https://data-api.polymarket.com/positions?user=${target}`);
+            const baseUrl = 'https://data-api.polymarket.com/positions';
+            const targetRes = await axios.get(`${baseUrl}?user=${target}`);
+
             if (targetRes.data && Array.isArray(targetRes.data)) {
                 let count = 0;
                 targetRes.data.forEach((p: any) => {
-                    const info = db.prepare('INSERT OR IGNORE INTO ineligible_markets (condition_id, reason, timestamp) VALUES (?, ?, ?)').run(
-                        p.conditionId,
-                        `Target ${target} already active`,
-                        Date.now()
-                    );
-                    if (info.changes > 0) count++;
+                    // Populate Cache
+                    if (p.asset && p.conditionId) {
+                        const marketData = {
+                            marketId: p.conditionId,
+                            outcome: p.outcome,
+                            slug: p.slug,
+                            assetId: p.asset
+                        };
+                        cacheMarket(p.asset, marketData);
+                    }
                 });
-                if (count > 0) console.log(`[SYNC] Marked ${count} new markets as ineligible from target ${target}.`);
+                // if (count > 0) console.log(`[SYNC] Marked ${count} new markets as ineligible from target ${target}.`);
             }
         } catch (e: any) {
             console.warn(`[SYNC] Could not fetch positions for target ${target}: ${e.message}`);
@@ -175,7 +304,7 @@ async function syncExistingPositions(userAddress: string, targets: string[]) {
     console.log('[SYNC] Portfolio synchronization complete.');
 }
 
-import { CONDITIONAL_TOKENS_ABI, CONDITIONAL_TOKENS_ADDR, USDC_E_ADDR } from './abi';
+import { CONDITIONAL_TOKENS_ABI, CONDITIONAL_TOKENS_ADDR, USDC_E_ADDR, CTF_EXCHANGE_ADDR_BINARY, CTF_EXCHANGE_ABI } from './abi';
 
 export async function claimPositions() {
     console.log('[TRADER] Checking for redeemable positions...');
@@ -190,49 +319,18 @@ export async function claimPositions() {
         }
 
         console.log(`[TRADER] Found ${redeemable.length} redeemable positions.`);
-        let claimCount = 0;
+        let resultMsg = `🏆 Encontradas ${redeemable.length} posiciones ganadoras.\n\n`;
+
+        if (config.proxyAddress) {
+            resultMsg += `⚠️ Nota: Como usas **Proxy Mode**, los fondos están seguros en tu Gnosis Safe. Para reclamarlos, entra en polymarket.com/portfolio y presiona "Redeem". El bot no puede tocar tu Safe directamente por seguridad.`;
+            return resultMsg;
+        }
 
         for (const pos of redeemable) {
             try {
-                console.log(`[TRADER] Claiming: ${pos.title} (${pos.outcome})`);
-
-                // Polymarket Binary markets use a simple indexSet: [1] for Outcome 0 (Yes), [2] for Outcome 1 (No)
-                // Actually, the indexSet is a bitmask. For a 2-outcome market:
-                // Outcome 0: indexSet = 1 << 0 = 1
-                // Outcome 1: indexSet = 1 << 1 = 2
+                console.log(`[TRADER] Attempting Claim for EOA: ${pos.title}`);
                 const indexSet = [1 << pos.outcomeIndex];
-
                 const ctf = new ethers.Contract(CONDITIONAL_TOKENS_ADDR, CONDITIONAL_TOKENS_ABI, signer);
-
-                // If using a Proxy, we usually need to execute this via the Proxy if the tokens are held there
-                // However, redeemPositions can often be called by anyone as long as they specify the correct 'owner' 
-                // Wait, most implementations of ConditionalTokens require the msg.sender to be the owner or authorized.
-                // Our Proxy (Gnosis Safe) holds the tokens.
-
-                // For Gnosis Safe, we'd need to encode the call and send it via the safe.
-                // But let's check if the SDK has a helper. (It doesn't seem to have a direct one).
-
-                // Let's implement a direct call first, and if it fails due to Proxy ownership, we'll note it.
-                // Note: Simple 'redeemPositions' doesn't take an 'owner' arg, it redeems for msg.sender.
-
-                // If funder is Proxy, we MUST exeucte via Proxy.
-                if (config.proxyAddress) {
-                    console.log(`[TRADER] Executing redemption via Proxy: ${config.proxyAddress}`);
-                    // Encoding the CTF call
-                    const data = ctf.interface.encodeFunctionData("redeemPositions", [
-                        USDC_E_ADDR,
-                        ethers.constants.HashZero, // parentCollectionId
-                        pos.conditionId,
-                        indexSet
-                    ]);
-
-                    // Gnosis Safe 'execTransaction' or similar would be needed here.
-                    // This is complex. Let's try the direct call first and see if the user's setup allows it.
-                    // Actually, if the tokens are in the Proxy, msg.sender MUST be the Proxy.
-
-                    // TODO: Implement Gnosis Safe transaction execution if direct call fails.
-                    // For now, we attempt direct call for simplicity.
-                }
 
                 const tx = await ctf.redeemPositions(
                     USDC_E_ADDR,
@@ -240,24 +338,20 @@ export async function claimPositions() {
                     pos.conditionId,
                     indexSet,
                     {
-                        gasLimit: 200000,
-                        maxPriorityFeePerGas: ethers.utils.parseUnits('35', 'gwei'),
-                        maxFeePerGas: ethers.utils.parseUnits('60', 'gwei')
+                        gasLimit: 300000,
+                        maxPriorityFeePerGas: ethers.utils.parseUnits('45', 'gwei'),
+                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei')
                     }
                 );
 
                 console.log(`[TRADER] Redemption Tx sent: ${tx.hash}`);
                 await tx.wait();
-
-                // Update DB
                 db.prepare('UPDATE positions SET status = ? WHERE market_id = ? AND outcome = ?').run('CLOSED', pos.conditionId, pos.outcome);
-                claimCount++;
             } catch (err: any) {
-                console.error(`[TRADER] Failed to claim ${pos.conditionId}:`, err.message);
+                console.error(`[TRADER] Failed to claim:`, err.message);
             }
         }
-
-        return `✅ Claimed ${claimCount} positions.`;
+        return "✅ Ganancias reclamadas (EOA).";
     } catch (e: any) {
         console.error('[TRADER] Error in claimPositions:', e.message);
         return `❌ Error: ${e.message}`;
@@ -266,76 +360,29 @@ export async function claimPositions() {
 
 export async function closeAllPositions() {
     console.log('[TRADER] Closing all open positions...');
-    const positions = db.prepare('SELECT * FROM positions WHERE status = ?').all('OPEN') as any[];
+    const positions = db.prepare('SELECT * FROM positions WHERE status = ?').all('OPEN') as Position[];
 
     if (positions.length === 0) {
         return "No open positions to close.";
     }
 
     let closedCount = 0;
-    let skipCount = 0;
     let errorCount = 0;
 
     for (const pos of positions) {
+        console.log(`[TRADER] Closing position: ${pos.market_id} (${pos.outcome})`);
         try {
-            console.log(`[TRADER] Closing position: ${pos.market_id} (${pos.outcome})`);
-
-            const funder = clobClient.orderBuilder.funderAddress || signer.address;
-            const posRes = await axios.get(`https://data-api.polymarket.com/positions?user=${funder}`);
-            const livePos = posRes.data.find((p: any) => p.conditionId === pos.market_id);
-
-            if (!livePos || parseFloat(livePos.size) <= 0) {
-                console.log(`[TRADER] Position ${pos.market_id} has 0 balance on-chain. Marking as CLOSED.`);
-                db.prepare('UPDATE positions SET status = ? WHERE market_id = ? AND outcome = ?').run('CLOSED', pos.market_id, pos.outcome);
-                closedCount++;
-                continue;
-            }
-
-            const size = Math.floor(parseFloat(livePos.size));
-            const assetId = livePos.asset;
-
-            // 1. Fetch correct Fee Rate for this specific market
-            let feeRateBps = 0;
-            try {
-                feeRateBps = await clobClient.getFeeRateBps(assetId);
-                console.log(`[TRADER] Fee Rate for ${pos.market_id}: ${feeRateBps} BPS`);
-            } catch (feeErr: any) {
-                console.warn(`[TRADER] Could not fetch fee for ${assetId}, trying 0: ${feeErr.message}`);
-            }
-
-            // 2. Place Sell Order
-            const orderArgs = {
-                tokenID: assetId,
-                price: 0.001,
-                side: Side.SELL,
-                size: size,
-                feeRateBps: feeRateBps
-            };
-
-            const response = await clobClient.createAndPostOrder(orderArgs);
-            console.log(`[TRADER] Sell Order Response for ${pos.market_id}:`, response);
-
-            if ((response as any).status === 'OK' || (response as any).status === 'success' || (response as any).status === 200) {
-                db.prepare('UPDATE positions SET status = ? WHERE market_id = ? AND outcome = ?').run('CLOSED', pos.market_id, pos.outcome);
-                closedCount++;
-            } else {
-                const errorMsg = (response as any).error || JSON.stringify(response);
-                if (errorMsg.includes("orderbook") && errorMsg.includes("not exist")) {
-                    console.warn(`[TRADER] Orderbook for ${pos.market_id} does not exist. Skipping.`);
-                    skipCount++;
-                    db.prepare('UPDATE positions SET status = ? WHERE market_id = ? AND outcome = ?').run('CLOSED', pos.market_id, pos.outcome);
-                } else {
-                    throw new Error(errorMsg);
-                }
-            }
-
+            await closeSpecificPosition(pos);
+            closedCount++;
         } catch (e: any) {
-            console.error(`[TRADER] Failed to close position ${pos.market_id}:`, e.message);
+            console.error(`[TRADER] Failed to close ${pos.market_id}: ${e.message}`);
             errorCount++;
         }
+        // Delay to avoid RPC rate limits (Free tier is generous but bursty)
+        await new Promise(r => setTimeout(r, 2000));
     }
 
-    return `✅ Cerradas ${closedCount} posiciones.${skipCount > 0 ? ` ⏭️ Omitidas ${skipCount} (Sin orderbook).` : ''}${errorCount > 0 ? ` ⚠️ ${errorCount} errores.` : ''}`;
+    return `✅ Intentado cerrar ${positions.length} posiciones.\n(Revisa los logs para confirmar ejecución).`;
 }
 
 export async function getBalances(): Promise<Balances> {
@@ -435,16 +482,21 @@ export async function getBalances(): Promise<Balances> {
 }
 
 monitorEvents.on('trade_detected', async (event: any) => {
+    if (isPaused) {
+        console.log(`[TRADER] ⏸️ Paused. Skipping trade from ${event.txHash}`);
+        return;
+    }
+
     if (!isTraderReady) {
         console.log(`[TRADER] Not ready yet. Skipping trade detection from ${event.txHash}`);
         return;
     }
 
     const now = Date.now();
-    if (now - lastTradeTime < MIN_TRADE_INTERVAL_MS) {
-        console.log(`[TRADER] Cooldown active. Skipping trade from ${event.txHash} (Target is trading too fast)`);
-        return;
-    }
+    // if (now - lastTradeTime < MIN_TRADE_INTERVAL_MS) {
+    //     console.log(`[TRADER] Cooldown active. Skipping trade from ${event.txHash} (Target is trading too fast)`);
+    //     return;
+    // }
 
     lastTradeTime = now;
 
@@ -463,20 +515,59 @@ monitorEvents.on('trade_detected', async (event: any) => {
 
         console.log(`[TRADER] Resolved: Market=${position.slug}, Outcome=${position.outcome} (${position.assetId})`);
 
-        // 2. Filter Duplicates and Ineligible Markets
-        const existing = db.prepare('SELECT status FROM positions WHERE market_id = ? AND status = ?').get(position.marketId, 'OPEN') as { status: string } | undefined;
+        // 2. Filter Duplicates (MODIFIED: Allow Add-ons)
+        // We used to return here if 'existing' was found. 
+        // Now we just fetch it to decide whether to INSERT or UPDATE later.
+        const existing = db.prepare('SELECT * FROM positions WHERE market_id = ? AND status = ?').get(position.marketId, 'OPEN') as Position | undefined;
+
         if (existing) {
-            console.log(`[TRADER] Skipping ${position.slug}: Already active in our positions.`);
-            return;
+            console.log(`[TRADER] Existing position found for ${position.slug}. Current Amount: $${existing.amount}`);
+
+            // Check Max Exposure
+            if (existing.amount >= MAX_TOTAL_POSITION_SIZE_USD) {
+                console.log(`[TRADER] 🛡️ MAX EXPOSURE HIT ($${existing.amount}). Skipping additional buy for ${position.slug}`);
+                return;
+            }
+
+            // Check Cooldown
+            const cooldownKey = `${position.marketId}-${position.outcome}`;
+            const lastTradeUtc = lastTradePerMarketOutcome[cooldownKey] || 0;
+            const now = Date.now();
+            if (now - lastTradeUtc < TRADE_COOLDOWN_MS) {
+                console.log(`[TRADER] ⏳ COOLDOWN: Skipping ${position.slug} (${position.outcome}) - Last trade was ${(now - lastTradeUtc) / 1000}s ago`);
+                return;
+            }
         }
 
+        /*
         const ineligible = db.prepare('SELECT reason FROM ineligible_markets WHERE condition_id = ?').get(position.marketId) as { reason: string } | undefined;
         if (ineligible) {
             console.log(`[TRADER] Skipping ${position.slug}: Market is ineligible (${ineligible.reason})`);
             return;
         }
+        */
 
         // 3. Calculate $1 Amount
+        // ... (Buy logic remains same) ...
+
+        // ... (After Order Success) ...
+
+
+        // --- HANDLE SELL (EXIT) ---
+        if (event.side === 'SELL') {
+            console.log(`[TRADER] Target is SELLING ${position.slug}. Checking if we have a position...`);
+            const openPosition = db.prepare('SELECT * FROM positions WHERE market_id = ? AND status = ?').get(position.marketId, 'OPEN') as Position | undefined;
+
+            if (openPosition) {
+                console.log(`[TRADER] 🚨 MATCHING EXIT: Closing position in ${position.slug} to match target.`);
+                await closeSpecificPosition(openPosition); // We need to implement this helper or allow closeAll to take an arg
+            } else {
+                console.log(`[TRADER] Target sold ${position.slug}, but we don't have an open position. Ignoring.`);
+            }
+            return;
+        }
+
+        // --- HANDLE BUY (ENTRY) ---
         if (!clobClient) {
             console.log(`[DRY-RUN] Would buy $1 of ${position.slug} (${position.outcome})`);
             const notificationData: TradeNotificationData = {
@@ -508,9 +599,14 @@ monitorEvents.on('trade_detected', async (event: any) => {
             return;
         }
 
-        // Ensure we hit the $1 minimum by using ceil
+        // Ensure we hit the $1 minimum by using ceil, AND the CLOB minimum size (usually 5 shares)
         const rawSize = config.maxPositionSizeUsd / bestAsk;
-        const size = Math.ceil(rawSize);
+        const MIN_SHARES = 5;
+        const size = Math.max(MIN_SHARES, Math.ceil(rawSize));
+
+        if (size * bestAsk > config.maxPositionSizeUsd * 2) {
+            console.warn(`[TRADER] ⚠️ Min size (${size}) forces trade value ($${(size * bestAsk).toFixed(2)}) to exceed limit ($${config.maxPositionSizeUsd})`);
+        }
 
         console.log(`[TRADER] Fetching fee rate for ${position.assetId}...`);
         let feeRateBps = 0;
@@ -542,39 +638,60 @@ monitorEvents.on('trade_detected', async (event: any) => {
 
         console.log('[TRADER] Order Executed:', response);
 
-        if ((response as any).status !== 'OK' && (response as any).status !== 200 && (response as any).status !== 'success' && (response as any).status !== 'OK') {
+        const res = response as any;
+        const isSuccess = res.status === 'OK' || res.status === 200 || res.status === 'success' || res.status === 'matched' || res.success === true;
+
+        if (!isSuccess) {
             console.error('[TRADER] Order Failed Response:', JSON.stringify(response));
-            const errMsg = (response as any).error || (response as any).message || 'Unknown error';
+            const errMsg = res.error || res.message || 'Unknown error';
             throw new Error(`PolyMarket API Error: ${errMsg}`);
         }
 
-        // Record ONLY if successful
-        db.prepare('INSERT INTO positions (market_id, outcome, amount, status, entry_price, timestamp, target_user) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-            position.marketId,
-            position.outcome,
-            config.maxPositionSizeUsd,
-            'OPEN',
-            bestAsk,
-            Date.now(),
-            event.user
-        );
+        // --- SUCCESS HANDLING ---
+        console.log(`[TRADER] Buy Order Success: ${res.orderID}`);
 
-        // Fetch latest balances for notification
-        const finalBalances = await getBalances();
-
+        // NOTIFICATION
         const notificationData: TradeNotificationData = {
             targetUser: event.user,
-            targetName: TARGET_NAMES[event.user.toLowerCase()],
+            targetName: TARGET_NAMES[event.user.toLowerCase()] || 'Target',
             marketSlug: position.slug,
             marketId: position.marketId,
             side: 'BUY',
             outcome: position.outcome,
             amountUsd: config.maxPositionSizeUsd,
-            price: bestAsk,
-            txHash: (response as any)?.orderHash || (response as any)?.transactionHash || 'PENDING',
-            newBalance: `${finalBalances.cash} USDC (Portfolio: $${finalBalances.portfolio})`
+            price: limitPrice,
+            txHash: res.transactionsHashes?.[0] || res.orderID,
+            newBalance: '...' // We fetch balances later
         };
         sendTradeNotification(notificationData);
+
+        // DATABASE UPDATE
+        const cooldownKey = `${position.marketId}-${position.outcome}`;
+        lastTradePerMarketOutcome[cooldownKey] = Date.now();
+
+        if (existing) {
+            console.log(`[TRADER] Updating existing position ${existing.id}...`);
+            const newAmount = existing.amount + config.maxPositionSizeUsd;
+            // Update amount and timestamp. Keep original entry_price? 
+            // Or update entry_price to weighted avg? 
+            // Let's just update timestamp for now to show activity.
+            db.prepare('UPDATE positions SET amount = ?, timestamp = ? WHERE id = ?').run(newAmount, Date.now(), existing.id);
+            console.log(`[TRADER] Updated existing position ${existing.id} (New Total: $${newAmount})`);
+        } else {
+            // Insert NEW position
+            db.prepare('INSERT INTO positions (market_id, outcome, amount, status, entry_price, timestamp, target_user, slug) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+                position.marketId,
+                position.outcome,
+                config.maxPositionSizeUsd,
+                'OPEN',
+                limitPrice,
+                Date.now(),
+                event.user,
+                position.slug
+            );
+            console.log(`[TRADER] Recorded new position for ${position.slug}`);
+        }
+
 
     } catch (err: any) {
         console.error('[TRADER] Error executing trade:', err.message);

@@ -3,10 +3,22 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
+  "bin": "dist/src/index.js",
   "scripts": {
     "start": "tsc && node dist/src/index.js",
     "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "exe": "npm run build && pkg . --targets node18-win-x64 --output bot.exe",
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "pkg": {
+    "assets": [
+      "dist/**/*"
+    ],
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "."
   },
   "keywords": [],
   "author": "",
@@ -26,6 +38,7 @@
     "@types/form-data": "^2.2.1",
     "@types/node": "^25.2.3",
     "@types/node-telegram-bot-api": "^0.64.13",
+    "pkg": "^5.8.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

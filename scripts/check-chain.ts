@@ -1,37 +1,47 @@
 import { ethers } from 'ethers';
-import { CTF_EXCHANGE_ABI, CTF_EXCHANGE_ADDR_BINARY } from '../src/abi';
+import { CTF_EXCHANGE_ABI } from '../src/abi';
 
-const RPC_URL = 'https://polygon-rpc.com';
-const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+const RPC = "https://polygon-rpc.com";
+const EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const INTERFACE = new ethers.utils.Interface(CTF_EXCHANGE_ABI);
 
-async function checkEvents(contractAddress: string, name: string) {
-    const contract = new ethers.Contract(contractAddress, CTF_EXCHANGE_ABI, provider);
-    console.log(`Checking ${name} (${contractAddress})...`);
+async function main() {
+    const user = process.argv[2];
+    if (!user) {
+        console.log("Usage: npx ts-node scripts/check-chain.ts <address>");
+        return;
+    }
 
-    try {
-        const blockNumber = await provider.getBlockNumber();
-        console.log(`Current Block: ${blockNumber}`);
-        const fromBlock = blockNumber - 100;
+    const provider = new ethers.providers.JsonRpcProvider(RPC);
+    const endBlock = await provider.getBlockNumber();
+    const startBlock = endBlock - 30; // Scan last 30 blocks for speed and RPC limits
 
-        // Filter for any OrderFilled event
-        const events = await contract.queryFilter('OrderFilled', fromBlock, blockNumber);
-        console.log(`Found ${events.length} events in last 100 blocks for ${name}.`);
+    console.log(`Scanning ${user} from block ${startBlock} to ${endBlock}...`);
 
-        events.forEach((event, index) => {
-            if (event.args) {
-                console.log(`Event ${index}: maker=${event.args[1]} taker=${event.args[2]}`);
+    const filter = {
+        address: EXCHANGE,
+        fromBlock: startBlock,
+        toBlock: endBlock,
+        topics: [ethers.utils.id("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)")]
+    };
+
+    const logs = await provider.getLogs(filter);
+    console.log(`Found ${logs.length} total fills in ${endBlock - startBlock} blocks.`);
+
+    for (const log of logs) {
+        try {
+            const parsed = INTERFACE.parseLog(log);
+            const { maker, taker, makerAssetId, takerAssetId } = parsed.args;
+
+            if (maker.toLowerCase() === user.toLowerCase() || taker.toLowerCase() === user.toLowerCase()) {
+                const isMaker = maker.toLowerCase() === user.toLowerCase();
+                const spentId = isMaker ? makerAssetId : takerAssetId;
+                const side = spentId.toString() === '0' ? 'BUY' : 'SELL';
+
+                console.log(`[TARGET] TX: ${log.transactionHash.substring(0, 10)}... | Side: ${side} | UserRole: ${isMaker ? 'Maker' : 'Taker'}`);
             }
-        });
-
-    } catch (error: any) {
-        console.error(`Error checking ${name}:`, error);
-        if (error.info) console.error('Error Info:', error.info);
-        if (error.code) console.error('Error Code:', error.code);
+        } catch (e) { }
     }
 }
 
-async function run() {
-    await checkEvents(CTF_EXCHANGE_ADDR_BINARY, 'Binary Exchange');
-}
-
-run();
+main();

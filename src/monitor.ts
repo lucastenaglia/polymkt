@@ -60,38 +60,32 @@ async function processLog(log: ethers.providers.Log) {
         // - Conditional Token is the "Base" currency.
 
         // Logic:
-        // If User gave Collateral -> They BOUGHT Outcome.
-        // If User gave Outcome -> They SOLD Outcome.
+        // If User gave Collateral (ID 0) -> They SPENT money -> BUY.
+        // If User gave Outcome Token (ID != 0) -> They SPENT shares -> SELL.
 
-        // We need to identify which asset is collateral.
-        // However, we can infer common patterns.
-        // Let's assume for now we emit the raw info and let the Trader/Analyzer decide 
-        // or just assume if one ID matches USDC (which we don't know the ID of in this context easily without mapping).
-        // Actually, `makerAssetId` and `takerAssetId` are Token IDs in the CTF (ERC1155). 
-        // Collateral is often represented specially or we need to know the Condition ID.
+        // Note: CTF Exchange uses 0 for collateral (USDC). 
+        // We compare as strings "0" just to be safe.
 
-        // For the prompt "Copiar ... (YES/NO)", we need to know strictly:
-        // 1. Is it a Buy or Sell?
-        // 2. What Market? (Condition ID)
-        // 3. What Outcome? (Index)
+        let side: 'BUY' | 'SELL' = 'BUY'; // Default (conservative, but we will overwrite)
 
-        // Parsing Asset ID to Condition ID + Index:
-        // This is complex. But we can just "Copy" the trade by mimicking the user's action?
-        // "Ejecutar inmediatamente la misma operación"
-        // "Copiar la misma dirección (YES/NO)"
+        if (user.toLowerCase() === maker.toLowerCase()) {
+            // User is Maker
+            if (makerAssetId.toString() === '0') {
+                side = 'BUY';
+            } else {
+                side = 'SELL';
+            }
+        } else {
+            // User is Taker
+            if (takerAssetId.toString() === '0') {
+                side = 'BUY';
+            } else {
+                side = 'SELL';
+            }
+        }
 
-        // If we can't easily decode the Asset ID to a human readable "YES/NO", 
-        // we can still copy the *intent* if we can map the Asset ID to the market.
+        console.log(`[MONITOR] Trade detected for ${user} in tx ${txHash} [${side}]`);
 
-        // IMPORTANT: decoding the Asset ID requires bitwise operations.
-        // CollectionId = AssetId
-        // PositionId = hash(Collateral, CollectionId)
-
-        // Let's emit the raw data and let a helper decode it, or try to fetch data from API using the AssetID?
-        // The Data API `GET /positions` might help if we query the user immediately after.
-        // OR we can use the `market` field if we had it.
-
-        // Temporary strategy: Emit the asset IDs. The trader will need to resolve them.
         monitorEvents.emit('trade_detected', {
             user,
             txHash,
@@ -100,7 +94,8 @@ async function processLog(log: ethers.providers.Log) {
             makerAssetId: makerAssetId.toString(),
             takerAssetId: takerAssetId.toString(),
             makerAmount: makerAmountFilled.toString(),
-            takerAmount: takerAmountFilled.toString()
+            takerAmount: takerAmountFilled.toString(),
+            side // Emit derived side
         });
 
     } catch (err) {

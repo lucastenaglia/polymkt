@@ -4,9 +4,12 @@ export const CTF_EXCHANGE_ABI = [
 
 export const CONDITIONAL_TOKENS_ABI = [
     "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets) external",
-    "function getOutcomeSlotCount(bytes32 conditionId) external view returns (uint256)"
+    "function getOutcomeSlotCount(bytes32 conditionId) external view returns (uint256)",
+    "function balanceOf(address owner, uint256 id) view returns (uint256)",
+    "function isApprovedForAll(address owner, address operator) view returns (bool)",
+    "function setApprovalForAll(address operator, bool approved) external"
 ];
 
 export const CTF_EXCHANGE_ADDR_BINARY = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
-export const CONDITIONAL_TOKENS_ADDR = '0x4D97BcdB59363486C1489999Bc31ba6eE99A2946';
+export const CONDITIONAL_TOKENS_ADDR = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 export const USDC_E_ADDR = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';

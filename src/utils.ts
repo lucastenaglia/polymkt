@@ -4,27 +4,25 @@ import axios from 'axios';
 const assetCache = new Map<string, any>();
 
 export async function resolveAsset(assetId: string) {
-    if (assetCache.has(assetId)) return assetCache.get(assetId);
-
-    // Use Gamma API or Data API to reverse lookup?
-    // Data API 'GET /markets' returns tokenIds.
-    // There isn't a direct "AssetID -> Market" endpoint usually documented publicly easily.
-    // However, we can use GraphQL or just search.
-
-    // Strategy: 
-    // If we have the Market Condition ID, we can compute Asset IDs.
-    // But we have the reverse.
-
-    // Alternative:
-    // Query Gamma API for *active* markets and cache their token IDs?
-    // Or simpler: The `trade_detected` provided the user address.
-    // We can query `GET /positions?user=TARGET` immediately.
-    // The new position should be there!
-
+    if (assetCache.has(assetId)) {
+        console.log(`[UTILS] Resolved asset ${assetId} from cache.`);
+        return assetCache.get(assetId);
+    }
     return null;
 }
 
+export function cacheMarket(assetId: string, marketData: any) {
+    if (!assetCache.has(assetId)) {
+        assetCache.set(assetId, marketData);
+        // console.log(`[UTILS] Cached asset ${assetId} -> ${marketData.slug}`);
+    }
+}
+
 export async function getMarketFromUserPosition(user: string, assetId: string) {
+    // 1. Check Cache
+    const cached = await resolveAsset(assetId);
+    if (cached) return cached;
+
     try {
         // Poll positions for this user
         // We know they JUST traded.
@@ -35,12 +33,14 @@ export async function getMarketFromUserPosition(user: string, assetId: string) {
             // The API returns 'asset' (token ID).
             const match = res.data.find((p: any) => p.asset === assetId);
             if (match) {
-                return {
+                const marketData = {
                     marketId: match.conditionId,
                     outcome: match.outcome,
                     slug: match.slug,
                     assetId: match.asset
                 };
+                cacheMarket(assetId, marketData);
+                return marketData;
             }
         }
     } catch (e) {
