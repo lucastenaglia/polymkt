@@ -137,7 +137,6 @@ export async function sendTradeNotification(data: TradeNotificationData) {
 ⚖️ *Side*: ${data.side} (${data.outcome})
 💰 *Amount*: $${data.amountUsd}
 💸 *Entry Price*: $${data.price}
-🔗 *TX*: [View on PolygonScan](https://polygonscan.com/tx/${data.txHash})
 
 💰 *Bot Balance*: ${data.newBalance}
 `;
