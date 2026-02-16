@@ -184,6 +184,10 @@ export async function sendErrorNotification(error: any) {
         const errorString = typeof error === 'string' ? error : (error?.message || JSON.stringify(error) || 'Unknown Error');
         // Prevent massive error spam
         if (errorString.includes('ETIMEDOUT') || errorString.includes('socket hang up')) return;
+        if (errorString.toLowerCase().includes('not enough balance') || errorString.toLowerCase().includes('allowance')) {
+            console.log('[TELEGRAM] Suppressed balance/allowance error notification.');
+            return;
+        }
 
         const text = `⚠️ *Error*: ${errorString.replace(/_/g, '\\_')}`; // Escape underscores
         await bot.sendMessage(config.telegramChatId, text, { parse_mode: 'Markdown' });
