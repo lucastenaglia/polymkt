@@ -325,10 +325,10 @@ async function getDynamicGasFees() {
         // Max Fee should be base fee + priority fee. 
         // We'll use feeData.maxFeePerGas if it looks reasonable, or calculate from baseFee.
         const baseFee = feeData.lastBaseFeePerGas || ethers.utils.parseUnits('100', 'gwei');
-        let maxFee = baseFee.add(maxPriorityFee).mul(130).div(100); // 30% margin on top of base+tip
+        let maxFee = baseFee.add(maxPriorityFee).mul(135).div(100); // 35% margin on top of base+tip
 
-        // Cap maxFee at 500 Gwei to avoid "exceeds cap" errors unless market is insane
-        const capWeight = ethers.utils.parseUnits('500', 'gwei');
+        // Cap maxFee at 1500 Gwei to handle extreme congestion (common in Polygon)
+        const capWeight = ethers.utils.parseUnits('1500', 'gwei');
         if (maxFee.gt(capWeight)) {
             maxFee = capWeight;
         }
@@ -481,7 +481,9 @@ export async function claimPositions() {
         }
 
         if (successCount === 0 && redeemable.length > 0) {
-            return `❌ Error: No se pudo cobrar ninguna de las ${redeemable.length} posiciones (posible congestión o límite de RPC).`;
+            const currentGas = await provider.getFeeData();
+            const baseGwei = ethers.utils.formatUnits(currentGas.lastBaseFeePerGas || 0, 'gwei');
+            return `❌ Error: No se pudo cobrar ninguna de las ${redeemable.length} posiciones (Gas Base: ${parseFloat(baseGwei).toFixed(0)} Gwei - Red muy congestionada).`;
         }
 
         return `✅ Reclamadas ${successCount} de ${redeemable.length} posiciones ganadoras.`;
