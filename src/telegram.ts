@@ -4,8 +4,8 @@ import { getBalances } from './trader';
 import { getOpenPositions, getClosedPositions } from './db';
 import { Position, TradeNotificationData } from './types';
 
-// Initialize bot with polling enabled
-const bot = new TelegramBot(config.telegramToken, { polling: true });
+// Initialize bot with polling disabled by default
+const bot = new TelegramBot(config.telegramToken, { polling: false });
 
 // Handle Polling Errors (silence EFATAL noise)
 bot.on('polling_error', (error: any) => {
@@ -18,6 +18,7 @@ bot.on('polling_error', (error: any) => {
 
 export async function startBot() {
     console.log('🤖 Telegram Bot Started');
+    bot.startPolling();
 
     // Handle /start
     bot.onText(/\/start/, (msg: TelegramBot.Message) => {

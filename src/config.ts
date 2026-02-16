@@ -14,6 +14,7 @@ export const config = {
     polymktSecret: process.env.POLY_SECRET || '',
     polymktPassphrase: process.env.POLY_PASSPHRASE || '',
     proxyAddress: process.env.PROXY_ADDRESS || '',
+    autoClaimIntervalMs: parseInt(process.env.AUTO_CLAIM_INTERVAL_MS || '600000', 10),
 };
 
 if (!config.privateKey) {

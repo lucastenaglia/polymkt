@@ -304,54 +304,187 @@ async function syncExistingPositions(userAddress: string, targets: string[]) {
     console.log('[SYNC] Portfolio synchronization complete.');
 }
 
-import { CONDITIONAL_TOKENS_ABI, CONDITIONAL_TOKENS_ADDR, USDC_E_ADDR, CTF_EXCHANGE_ADDR_BINARY, CTF_EXCHANGE_ABI } from './abi';
+import { CONDITIONAL_TOKENS_ABI, CONDITIONAL_TOKENS_ADDR, USDC_E_ADDR, CTF_EXCHANGE_ADDR_BINARY, CTF_EXCHANGE_ABI, GNOSIS_SAFE_ABI, CTF_PROXY_ABI } from './abi';
+
+async function getDynamicGasFees() {
+    try {
+        const feeData = await provider.getFeeData();
+
+        // Polygon 100% requires higher priority fees during congestion.
+        // We set a hard floor of 30 Gwei for priority fee.
+        const minPriorityFee = ethers.utils.parseUnits('30', 'gwei');
+        let maxPriorityFee = feeData.maxPriorityFeePerGas || minPriorityFee;
+
+        if (maxPriorityFee.lt(minPriorityFee)) {
+            maxPriorityFee = minPriorityFee;
+        } else {
+            // If it's already high, add 20% buffer
+            maxPriorityFee = maxPriorityFee.mul(120).div(100);
+        }
+
+        // Max Fee should be base fee + priority fee. 
+        // We'll use feeData.maxFeePerGas if it looks reasonable, or calculate from baseFee.
+        const baseFee = feeData.lastBaseFeePerGas || ethers.utils.parseUnits('100', 'gwei');
+        let maxFee = baseFee.add(maxPriorityFee).mul(130).div(100); // 30% margin on top of base+tip
+
+        // Cap maxFee at 500 Gwei to avoid "exceeds cap" errors unless market is insane
+        const capWeight = ethers.utils.parseUnits('500', 'gwei');
+        if (maxFee.gt(capWeight)) {
+            maxFee = capWeight;
+        }
+
+        console.log(`[GAS] Tip: ${ethers.utils.formatUnits(maxPriorityFee, 'gwei')} Gwei | Max: ${ethers.utils.formatUnits(maxFee, 'gwei')} Gwei`);
+
+        return { maxPriorityFee, maxFee };
+    } catch (e) {
+        console.warn('[GAS] Failed to fetch live fee data, using defaults:', e);
+        return {
+            maxPriorityFee: ethers.utils.parseUnits('35', 'gwei'),
+            maxFee: ethers.utils.parseUnits('200', 'gwei')
+        };
+    }
+}
+
+async function redeemViaProxy(proxyAddr: string, conditionId: string, outcomeIndex: number) {
+    const proxy = new ethers.Contract(proxyAddr, GNOSIS_SAFE_ABI, signer);
+
+    try {
+        const indexSet = [1 << outcomeIndex];
+        const ctfInterface = new ethers.utils.Interface(CONDITIONAL_TOKENS_ABI);
+        const data = ctfInterface.encodeFunctionData("redeemPositions", [
+            USDC_E_ADDR,
+            ethers.constants.HashZero,
+            conditionId,
+            indexSet
+        ]);
+
+        console.log(`[TRADER] Attempting Gnosis Safe redemption for ${conditionId}...`);
+
+        // v=1 signature format for owner execution in threshold 1 Safes
+        const signature = `0x000000000000000000000000${signer.address.slice(2)}000000000000000000000000000000000000000000000000000000000000000001`;
+
+        const { maxPriorityFee, maxFee } = await getDynamicGasFees();
+
+        const tx = await proxy.execTransaction(
+            CONDITIONAL_TOKENS_ADDR,
+            0,
+            data,
+            0, // Operation.Call
+            0,
+            0,
+            0,
+            ethers.constants.AddressZero,
+            ethers.constants.AddressZero,
+            signature,
+            {
+                gasLimit: 600000,
+                maxPriorityFeePerGas: maxPriorityFee,
+                maxFeePerGas: maxFee
+            }
+        );
+
+        console.log(`[TRADER] Proxy Redemption Tx sent: ${tx.hash}. Waiting for confirmation...`);
+        const receipt = await tx.wait(1); // Wait for at least 1 confirmation
+        console.log(`✅ Proxy Redemption Confirmed in block ${receipt.blockNumber}`);
+        return true;
+    } catch (e: any) {
+        console.log(`[TRADER] Safe execTransaction skipped or failed: ${e.message}`);
+        // If it's a rate limit or fee cap error, propagate it to stop the loop
+        if (e.message.includes('rate limit') || e.message.includes('429') || e.message.includes('exceeds the configured cap')) {
+            throw e;
+        }
+
+        console.log(`[TRADER] Trying CtfProxy fallback for ${conditionId}...`);
+        const ctfProxy = new ethers.Contract(proxyAddr, CTF_PROXY_ABI, signer);
+        const indexSet = [1 << outcomeIndex];
+
+        const { maxPriorityFee, maxFee } = await getDynamicGasFees();
+
+        const tx = await ctfProxy.redeem(
+            USDC_E_ADDR,
+            ethers.constants.HashZero,
+            conditionId,
+            indexSet,
+            {
+                gasLimit: 400000,
+                maxPriorityFeePerGas: maxPriorityFee,
+                maxFeePerGas: maxFee
+            }
+        );
+        console.log(`[TRADER] CtfProxy Redemption Tx sent: ${tx.hash}. Waiting for confirmation...`);
+        const receipt = await tx.wait(1);
+        console.log(`✅ CtfProxy Redemption Confirmed in block ${receipt.blockNumber}`);
+        return true;
+    }
+}
 
 export async function claimPositions() {
     console.log('[TRADER] Checking for redeemable positions...');
     try {
-        const funder = clobClient.orderBuilder.funderAddress || signer.address;
+        const funder = clobClient?.orderBuilder?.funderAddress || config.proxyAddress || signer.address;
         const posRes = await axios.get(`https://data-api.polymarket.com/positions?user=${funder}`);
 
         const redeemable = posRes.data.filter((p: any) => p.redeemable === true);
 
         if (redeemable.length === 0) {
+            console.log('[TRADER] No redeemable positions found.');
             return "No winning positions to claim.";
         }
 
         console.log(`[TRADER] Found ${redeemable.length} redeemable positions.`);
-        let resultMsg = `🏆 Encontradas ${redeemable.length} posiciones ganadoras.\n\n`;
-
-        if (config.proxyAddress) {
-            resultMsg += `⚠️ Nota: Como usas **Proxy Mode**, los fondos están seguros en tu Gnosis Safe. Para reclamarlos, entra en polymarket.com/portfolio y presiona "Redeem". El bot no puede tocar tu Safe directamente por seguridad.`;
-            return resultMsg;
-        }
+        let successCount = 0;
 
         for (const pos of redeemable) {
             try {
-                console.log(`[TRADER] Attempting Claim for EOA: ${pos.title}`);
-                const indexSet = [1 << pos.outcomeIndex];
-                const ctf = new ethers.Contract(CONDITIONAL_TOKENS_ADDR, CONDITIONAL_TOKENS_ABI, signer);
+                console.log(`[TRADER] Attempting Claim for: ${pos.title || pos.conditionId}`);
 
-                const tx = await ctf.redeemPositions(
-                    USDC_E_ADDR,
-                    ethers.constants.HashZero,
-                    pos.conditionId,
-                    indexSet,
-                    {
-                        gasLimit: 300000,
-                        maxPriorityFeePerGas: ethers.utils.parseUnits('45', 'gwei'),
-                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei')
-                    }
-                );
+                if (config.proxyAddress) {
+                    await redeemViaProxy(config.proxyAddress, pos.conditionId, pos.outcomeIndex);
+                } else {
+                    const indexSet = [1 << pos.outcomeIndex];
+                    const ctf = new ethers.Contract(CONDITIONAL_TOKENS_ADDR, CONDITIONAL_TOKENS_ABI, signer);
 
-                console.log(`[TRADER] Redemption Tx sent: ${tx.hash}`);
-                await tx.wait();
+                    const { maxPriorityFee, maxFee } = await getDynamicGasFees();
+
+                    const tx = await ctf.redeemPositions(
+                        USDC_E_ADDR,
+                        ethers.constants.HashZero,
+                        pos.conditionId,
+                        indexSet,
+                        {
+                            gasLimit: 300000,
+                            maxPriorityFeePerGas: maxPriorityFee,
+                            maxFeePerGas: maxFee
+                        }
+                    );
+                    console.log(`[TRADER] EOA Redemption Tx sent: ${tx.hash}. Waiting for confirmation...`);
+                    await tx.wait(1);
+                }
+
                 db.prepare('UPDATE positions SET status = ? WHERE market_id = ? AND outcome = ?').run('CLOSED', pos.conditionId, pos.outcome);
+                successCount++;
+
+                // Increase delay to 10s to avoid RPC "Too many requests"
+                console.log('[TRADER] Waiting 10s before next claim to respect RPC limits...');
+                await new Promise(r => setTimeout(r, 10000));
             } catch (err: any) {
-                console.error(`[TRADER] Failed to claim:`, err.message);
+                console.error(`[TRADER] ❌ Failed to claim ${pos.conditionId}:`, err.message);
+                if (err.message.includes('429') || err.message.includes('rate limit')) {
+                    console.warn('[TRADER] RPC Rate limit hit. Skipping further claims this round.');
+                    break;
+                }
+                if (err.message.includes('exceeds the configured cap')) {
+                    console.error('[TRADER] Fee exceeds node cap. This might be a temporary RPC issue.');
+                    break;
+                }
             }
         }
-        return "✅ Ganancias reclamadas (EOA).";
+
+        if (successCount === 0 && redeemable.length > 0) {
+            return `❌ Error: No se pudo cobrar ninguna de las ${redeemable.length} posiciones (posible congestión o límite de RPC).`;
+        }
+
+        return `✅ Reclamadas ${successCount} de ${redeemable.length} posiciones ganadoras.`;
     } catch (e: any) {
         console.error('[TRADER] Error in claimPositions:', e.message);
         return `❌ Error: ${e.message}`;
